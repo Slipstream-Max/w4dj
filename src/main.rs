@@ -9,6 +9,7 @@ use std::io::{self, Error, ErrorKind, Write};
 use std::path::Path;
 use toml;
 use walkdir::WalkDir;
+use text_to_ascii_art::to_art;
 
 #[derive(Parser)]
 #[command(
@@ -43,7 +44,8 @@ fn get_music_dict(folder: &str) -> HashMap<String, (String, String)> {
         })
         .map(|entry| {
             let path = entry.path().to_string_lossy().into_owned();
-            let stem = entry.path()
+            let stem = entry
+                .path()
                 .file_stem()
                 .and_then(|s| s.to_str())
                 .unwrap_or_default()
@@ -68,10 +70,8 @@ pub fn compare_music_dicts<'a>(
         .filter(|(name, wf_info)| {
             if let Some(sf_info) = sf_dict.get(*name) {
                 // Both exist, compare sizes
-                if let (Ok(size1), Ok(size2)) = (
-                    wf_info.0.parse::<u64>(),
-                    sf_info.0.parse::<u64>(),
-                ) {
+                if let (Ok(size1), Ok(size2)) = (wf_info.0.parse::<u64>(), sf_info.0.parse::<u64>())
+                {
                     let max_size = size1.max(size2) as f64;
                     if max_size > 0.0 {
                         let diff = (size1 as f64 - size2 as f64).abs();
@@ -200,6 +200,11 @@ fn process_ncm_file(src_path: &Path, dest_folder: &str, name_stem: &str) -> io::
 }
 
 fn main() -> Result<(), Error> {
+    match to_art("W4DJ".to_string(), "standard", 0, 2, 0) {
+        Ok(string) => println!("{}", string),
+        Err(err) => println!("Error: {}", err),
+    }
+
     let cmd = Cmd::parse();
     let config_file_path = cmd.config.expect("Clap should provide default value");
 
