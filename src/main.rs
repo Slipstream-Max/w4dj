@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{self, Error, ErrorKind, Write};
 use std::path::Path;
+use std::process::Command;
 use toml;
 use walkdir::WalkDir;
 use text_to_ascii_art::to_art;
@@ -24,9 +25,18 @@ struct Cmd {
 }
 
 #[derive(Debug, Deserialize)]
+enum Mode {
+    #[serde(rename = "default")]
+    Default,
+    #[serde(rename = "legacy")]
+    Legacy,
+}
+
+#[derive(Debug, Deserialize)]
 struct Config {
     source: String,
     destination: String,
+    mode: Mode,
 }
 
 fn get_music_dict(folder: &str) -> HashMap<String, (String, String)> {
@@ -87,9 +97,10 @@ pub fn compare_music_dicts<'a>(
         .collect()
 }
 
-pub fn sync_music_library(
+fn sync_music_library(
     new_songs: &HashMap<&String, &(String, String)>,
     dest_folder: &str,
+    mode: &Mode,
 ) -> io::Result<()> {
     if new_songs.is_empty() {
         return Ok(());
@@ -106,7 +117,6 @@ pub fn sync_music_library(
     let results: Vec<io::Result<()>> = new_songs
         .par_iter()
         .map(|(&name, info)| {
-            // Destructure name directly
             let src_path = Path::new(&info.1);
             let extension = src_path
                 .extension()
@@ -115,13 +125,20 @@ pub fn sync_music_library(
                 .to_lowercase();
 
             let task_result = match extension.as_str() {
-                "mp3" | "flac" => {
-                    bar.set_message(format!("Copying: {}", name));
+                "mp3" => {
+                    bar.set_message(format!("Copying MP3: {}", name));
                     copy_file(src_path, dest_folder, name)
                 }
+                "flac" => {
+                    bar.set_message(format!("Processing FLAC: {}", name));
+                    match mode {
+                        Mode::Default => copy_file(src_path, dest_folder, name),
+                        Mode::Legacy => convert_flac_to_mp3(src_path, dest_folder, name),
+                    }
+                }
                 "ncm" => {
-                    bar.set_message(format!("Dumping: {}", name));
-                    process_ncm_file(src_path, dest_folder, name)
+                    bar.set_message(format!("Dumping NCM: {}", name));
+                    process_ncm_file(src_path, dest_folder, name, mode)
                 }
                 _ => unreachable!(
                     "Invalid file extension '{}' for song '{}'. Filter failed.",
@@ -159,7 +176,37 @@ fn copy_file(src_path: &Path, dest_folder: &str, name_stem: &str) -> io::Result<
     fs::copy(src_path, &dest_path).map(|_| ())
 }
 
-fn process_ncm_file(src_path: &Path, dest_folder: &str, name_stem: &str) -> io::Result<()> {
+fn convert_flac_to_mp3(src_path: &Path, dest_folder: &str, name_stem: &str) -> io::Result<()> {
+    let output_path = Path::new(dest_folder).join(format!("{}.mp3", name_stem));
+    
+    let status = Command::new("ffmpeg")
+        .arg("-i")
+        .arg(src_path)
+        .arg("-q:a")
+        .arg("0")
+        .arg("-map_metadata")
+        .arg("0")
+        .arg("-id3v2_version")
+        .arg("3")
+        .arg(&output_path)
+        .status()?;
+
+    if !status.success() {
+        return Err(Error::new(
+            ErrorKind::Other,
+            format!("FFmpeg conversion failed for {}", name_stem),
+        ));
+    }
+
+    Ok(())
+}
+
+fn process_ncm_file(
+    src_path: &Path,
+    dest_folder: &str,
+    name_stem: &str,
+    mode: &Mode,
+) -> io::Result<()> {
     let file = File::open(src_path)?;
     let mut ncm = Ncmdump::from_reader(file).map_err(|e| {
         Error::new(
@@ -183,20 +230,56 @@ fn process_ncm_file(src_path: &Path, dest_folder: &str, name_stem: &str) -> io::
     })?;
 
     let file_format = if ncm_metadata.format.is_empty() {
-        "flac".to_string() // Default format
+        "flac".to_string()
     } else {
         ncm_metadata.format.to_lowercase()
     };
 
-    let dest_file_name = format!("{}.{}", name_stem, file_format);
-    let dest_path = Path::new(dest_folder).join(dest_file_name);
+    // First write the original format
+    let temp_file_name = format!("{}.{}", name_stem, file_format);
+    let temp_path = Path::new(dest_folder).join(&temp_file_name);
 
-    if let Some(parent) = dest_path.parent() {
+    if let Some(parent) = temp_path.parent() {
         fs::create_dir_all(parent)?;
     }
 
-    let mut target_file = File::create(&dest_path)?;
-    target_file.write_all(&music_data)
+    let mut temp_file = File::create(&temp_path)?;
+    temp_file.write_all(&music_data)?;
+
+    // Handle conversion if needed
+    match (mode, file_format.as_str()) {
+        (Mode::Legacy, "flac") => {
+            // Convert FLAC to MP3
+            let mp3_path = Path::new(dest_folder).join(format!("{}.mp3", name_stem));
+            
+            let status = Command::new("ffmpeg")
+                .arg("-i")
+                .arg(&temp_path)
+                .arg("-q:a")
+                .arg("0")
+                .arg("-map_metadata")
+                .arg("0")
+                .arg("-id3v2_version")
+                .arg("3")
+                .arg(&mp3_path)
+                .status()?;
+
+            if !status.success() {
+                return Err(Error::new(
+                    ErrorKind::Other,
+                    format!("FFmpeg conversion failed for {}", name_stem),
+                ));
+            }
+
+            // Remove the temporary FLAC file
+            fs::remove_file(&temp_path)?;
+        }
+        _ => {
+            // In default mode or if not FLAC, keep the original format
+        }
+    }
+
+    Ok(())
 }
 
 fn main() -> Result<(), Error> {
@@ -223,8 +306,8 @@ fn main() -> Result<(), Error> {
     })?;
 
     println!(
-        "Config loaded: Source='{}', Destination='{}'",
-        config.source, config.destination
+        "Config loaded: Source='{}', Destination='{}', Mode={:?}",
+        config.source, config.destination, config.mode
     );
 
     let wf = &config.source;
@@ -255,7 +338,7 @@ fn main() -> Result<(), Error> {
     println!("Found {} new songs to sync.", new_songs.len());
 
     if !new_songs.is_empty() {
-        sync_music_library(&new_songs, sf)?;
+        sync_music_library(&new_songs, sf, &config.mode)?;
     }
 
     println!("Sync completed successfully.");
