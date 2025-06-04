@@ -28,7 +28,7 @@ struct Config {
     destination: String,
 }
 
-fn get_music_dict(folder: &str) -> HashMap<String, HashMap<String, String>> {
+fn get_music_dict(folder: &str) -> HashMap<String, (String, String)> {
     WalkDir::new(folder)
         .into_iter()
         .filter_map(Result::ok)
@@ -42,8 +42,8 @@ fn get_music_dict(folder: &str) -> HashMap<String, HashMap<String, String>> {
                     })
         })
         .map(|entry| {
-            let path = entry.path();
-            let stem = path
+            let path = entry.path().to_string_lossy().into_owned();
+            let stem = entry.path()
                 .file_stem()
                 .and_then(|s| s.to_str())
                 .unwrap_or_default()
@@ -54,27 +54,23 @@ fn get_music_dict(folder: &str) -> HashMap<String, HashMap<String, String>> {
                 .map(|m| m.len().to_string())
                 .unwrap_or_else(|_| "0".to_string());
 
-            let mut file_info = HashMap::with_capacity(2);
-            file_info.insert("size".to_string(), size);
-            file_info.insert("path".to_string(), path.to_string_lossy().into_owned());
-
-            (stem, file_info)
+            (stem, (size, path))
         })
         .collect()
 }
 
 pub fn compare_music_dicts<'a>(
-    wf_dict: &'a HashMap<String, HashMap<String, String>>,
-    sf_dict: &'a HashMap<String, HashMap<String, String>>,
-) -> HashMap<&'a String, &'a HashMap<String, String>> {
+    wf_dict: &'a HashMap<String, (String, String)>,
+    sf_dict: &'a HashMap<String, (String, String)>,
+) -> HashMap<&'a String, &'a (String, String)> {
     wf_dict
         .iter()
         .filter(|(name, wf_info)| {
             if let Some(sf_info) = sf_dict.get(*name) {
                 // Both exist, compare sizes
                 if let (Ok(size1), Ok(size2)) = (
-                    wf_info.get("size").unwrap().parse::<u64>(),
-                    sf_info.get("size").unwrap().parse::<u64>(),
+                    wf_info.0.parse::<u64>(),
+                    sf_info.0.parse::<u64>(),
                 ) {
                     let max_size = size1.max(size2) as f64;
                     if max_size > 0.0 {
@@ -92,7 +88,7 @@ pub fn compare_music_dicts<'a>(
 }
 
 pub fn sync_music_library(
-    new_songs: &HashMap<&String, &HashMap<String, String>>,
+    new_songs: &HashMap<&String, &(String, String)>,
     dest_folder: &str,
 ) -> io::Result<()> {
     if new_songs.is_empty() {
@@ -111,7 +107,7 @@ pub fn sync_music_library(
         .par_iter()
         .map(|(&name, info)| {
             // Destructure name directly
-            let src_path = Path::new(&info["path"]);
+            let src_path = Path::new(&info.1);
             let extension = src_path
                 .extension()
                 .and_then(|ext| ext.to_str())

@@ -1,2 +1,2 @@
-source="/home/slipstream/CloudMusic"
-destination="/home/slipstream/Musics"
+source="./CloudMusic"
+destination="./Musics"
