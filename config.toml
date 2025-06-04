@@ -1,2 +1,3 @@
-source="./CloudMusic"
-destination="./Musics"
+source="/mnt/d/CloudMusic"
+destination="/mnt/d/CMusics"
+mode="legacy"
