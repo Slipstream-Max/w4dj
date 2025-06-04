@@ -11,6 +11,8 @@ use std::process::Command;
 use toml;
 use walkdir::WalkDir;
 use text_to_ascii_art::to_art;
+use std::env;
+use which;
 
 #[derive(Parser)]
 #[command(
@@ -37,6 +39,27 @@ struct Config {
     source: String,
     destination: String,
     mode: Mode,
+}
+
+
+
+fn find_ffmpeg() -> Option<String> {
+    // 首先检查当前目录下的 ffmpeg
+    if let Ok(exe_dir) = env::current_exe() {
+        if let Some(parent) = exe_dir.parent() {
+            let local_ffmpeg = parent.join("ffmpeg");
+            if local_ffmpeg.exists() {
+                return Some(local_ffmpeg.to_string_lossy().into_owned());
+            }
+        }
+    }
+    
+    // 然后检查系统 PATH 中的 ffmpeg
+    if let Ok(path) = which::which("ffmpeg") {
+        return Some(path.to_string_lossy().into_owned());
+    }
+    
+    None
 }
 
 fn get_music_dict(folder: &str) -> HashMap<String, (String, String)> {
@@ -71,27 +94,36 @@ fn get_music_dict(folder: &str) -> HashMap<String, (String, String)> {
         .collect()
 }
 
-pub fn compare_music_dicts<'a>(
+fn compare_music_dicts<'a>(
     wf_dict: &'a HashMap<String, (String, String)>,
     sf_dict: &'a HashMap<String, (String, String)>,
+    mode: &Mode,
 ) -> HashMap<&'a String, &'a (String, String)> {
     wf_dict
         .iter()
         .filter(|(name, wf_info)| {
-            if let Some(sf_info) = sf_dict.get(*name) {
-                // Both exist, compare sizes
-                if let (Ok(size1), Ok(size2)) = (wf_info.0.parse::<u64>(), sf_info.0.parse::<u64>())
-                {
-                    let max_size = size1.max(size2) as f64;
-                    if max_size > 0.0 {
-                        let diff = (size1 as f64 - size2 as f64).abs();
-                        return (diff / max_size) >= 0.05; // Keep if different enough
-                    }
-                    return size1 != size2; // If one size is 0, they are different unless both are 0
+            match mode {
+                Mode::Legacy => {
+                    // In legacy mode, just check if the file exists in destination
+                    !sf_dict.contains_key(*name)
                 }
-                true // Parsing failed, assume different
-            } else {
-                true // Not in sf_dict, so it's new
+                Mode::Default => {
+                    // In default mode, do the full comparison including size
+                    if let Some(sf_info) = sf_dict.get(*name) {
+                        // Both exist, compare sizes
+                        if let (Ok(size1), Ok(size2)) = (wf_info.0.parse::<u64>(), sf_info.0.parse::<u64>()) {
+                            let max_size = size1.max(size2) as f64;
+                            if max_size > 0.0 {
+                                let diff = (size1 as f64 - size2 as f64).abs();
+                                return (diff / max_size) >= 0.05; // Keep if different enough
+                            }
+                            return size1 != size2; // If one size is 0, they are different unless both are 0
+                        }
+                        true // Parsing failed, assume different
+                    } else {
+                        true // Not in sf_dict, so it's new
+                    }
+                }
             }
         })
         .collect()
@@ -178,8 +210,12 @@ fn copy_file(src_path: &Path, dest_folder: &str, name_stem: &str) -> io::Result<
 
 fn convert_flac_to_mp3(src_path: &Path, dest_folder: &str, name_stem: &str) -> io::Result<()> {
     let output_path = Path::new(dest_folder).join(format!("{}.mp3", name_stem));
+    let ffmpeg_path = find_ffmpeg().unwrap_or_else(|| {
+        eprintln!("FFmpeg not found. Please ensure it is installed and in your PATH.");
+        std::process::exit(1);
+    });
     
-    let status = Command::new("ffmpeg")
+    let status = Command::new(&ffmpeg_path)
         .arg("-i")
         .arg(src_path)
         .arg("-loglevel")
@@ -213,21 +249,21 @@ fn process_ncm_file(
     let mut ncm = Ncmdump::from_reader(file).map_err(|e| {
         Error::new(
             ErrorKind::InvalidData,
-            format!("NCM parse error for {}: {}", name_stem, e),
+            format!("NCM 解析错误 {}: {}", name_stem, e),
         )
     })?;
 
     let music_data = ncm.get_data().map_err(|e| {
         Error::new(
             ErrorKind::InvalidData,
-            format!("NCM data extraction error for {}: {}", name_stem, e),
+            format!("NCM 数据提取错误 {}: {}", name_stem, e),
         )
     })?;
 
     let ncm_metadata = ncm.get_info().map_err(|e| {
         Error::new(
             ErrorKind::InvalidData,
-            format!("NCM metadata error for {}: {}", name_stem, e),
+            format!("NCM 元数据错误 {}: {}", name_stem, e),
         )
     })?;
 
@@ -237,7 +273,7 @@ fn process_ncm_file(
         ncm_metadata.format.to_lowercase()
     };
 
-    // First write the original format
+    // 首先写入原始格式
     let temp_file_name = format!("{}.{}", name_stem, file_format);
     let temp_path = Path::new(dest_folder).join(&temp_file_name);
 
@@ -248,38 +284,16 @@ fn process_ncm_file(
     let mut temp_file = File::create(&temp_path)?;
     temp_file.write_all(&music_data)?;
 
-    // Handle conversion if needed
+    // 处理转换需求
     match (mode, file_format.as_str()) {
         (Mode::Legacy, "flac") => {
-            // Convert FLAC to MP3
-            let mp3_path = Path::new(dest_folder).join(format!("{}.mp3", name_stem));
-            
-            let status = Command::new("ffmpeg")
-                .arg("-i")
-                .arg(&temp_path)
-                .arg("-loglevel")
-                .arg("quiet")
-                .arg("-q:a")
-                .arg("0")
-                .arg("-map_metadata")
-                .arg("0")
-                .arg("-id3v2_version")
-                .arg("3")
-                .arg(&mp3_path)
-                .status()?;
-
-            if !status.success() {
-                return Err(Error::new(
-                    ErrorKind::Other,
-                    format!("FFmpeg conversion failed for {}", name_stem),
-                ));
-            }
-
-            // Remove the temporary FLAC file
+            // 复用 convert_flac_to_mp3 函数
+            convert_flac_to_mp3(&temp_path, dest_folder, name_stem)?;
+            // 删除临时 FLAC 文件
             fs::remove_file(&temp_path)?;
         }
         _ => {
-            // In default mode or if not FLAC, keep the original format
+            // 默认模式或非 FLAC 格式，保留原始文件
         }
     }
 
@@ -338,7 +352,7 @@ fn main() -> Result<(), Error> {
     let sf_dict = get_music_dict(sf);
     println!("Found {} music files in destination.", sf_dict.len());
 
-    let new_songs = compare_music_dicts(&wf_dict, &sf_dict);
+    let new_songs = compare_music_dicts(&wf_dict, &sf_dict, &config.mode);
     println!("Found {} new songs to sync.", new_songs.len());
 
     if !new_songs.is_empty() {
