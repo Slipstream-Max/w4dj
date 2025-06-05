@@ -5,7 +5,7 @@ W4DJ 是一个简单的命令行工具，用于同步网易云音乐（Netease C
 ## 功能特点
 
 - 🎵 扫描并同步网易云音乐下载的歌曲
-- 🔄 自动识别并转换 NCM 加密格式为 MP3/FLAC
+- 🔄 自动识别并转换 NCM 加密格式为 MP3直出或原格式输出
 - 📁 支持自定义源目录和目标目录
 - ⚡ rayon多线程处理，快速同步大量文件
 - 🚀 rust编写，内存占用极低
@@ -50,7 +50,7 @@ Windows路径需要`/`隔开
    ```toml
    source = "/path/to/netmusic/songs"       # 网易云音乐下载目录
    destination = "/path/to/music/library"   # 目标音乐库目录
-   mode = "legacy"                          # 同步模式，default为原格式输出模式，legacy为仅输出mp3模式
+   mode = "default"                          # 同步模式，default为原格式输出模式，legacy为仅输出mp3模式
    ```
 
 2. 运行程序：<br>
