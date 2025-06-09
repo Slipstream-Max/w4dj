@@ -14,7 +14,7 @@ W4DJ 是一个简单的命令行工具，用于同步网易云音乐（Netease C
 
 ## 安装
 
-### 从源码构建
+### 1.从源码构建
 
 1. 确保已安装 [Rust 工具链](https://www.rust-lang.org/tools/install)
 2. 克隆仓库：
@@ -41,41 +41,52 @@ Mac:
 brew install ffmpeg
 ```
 
-或直接把ffmpeg放入同一个层级目录，见release。
+### 2.见Release
+解压后设置config.toml 双击运行
 
 ## 使用方法
 
-1. 创建配置文件 `config.toml`：<br>
+
+### 1. 创建配置文件 `config.toml`：<br>
 Windows路径需要`/`隔开
+
+1. 歌曲同步器
    ```toml
    source = "/path/to/netmusic/songs"       # 网易云音乐下载目录
    destination = "/path/to/music/library"   # 目标音乐库目录
-   mode = "default"                          # 同步模式，default为原格式输出模式，legacy为仅输出mp3模式
+   mode = "default"                         # 同步模式，default为原格式输出模式
    ```
 
-2. 运行程序：<br>
-双击exe。
-   ```bash
-   ./w4dj
+2. 歌曲同步器（MP3）
+   ```toml
+   source = "/path/to/netmusic/songs"       # 网易云音乐下载目录
+   destination = "/path/to/music/library"   # 目标音乐库目录
+   mode = "legacy"                          # 同步模式，legacy仅输出mp3
    ```
+
+3. 歌曲转换器
+   ```toml
+   source = "/path/to/netmusic/songs"       # 待转换的目录
+   destination = "/path/to/music/library"   # 待输出目录
+   mode = "legacy"                          # legacy仅输出mp3
+   ```
+
+
+### 2.运行程序：
+
+双击exe。
+
    或指定配置文件路径：
    ```bash
    ./w4dj --config /path/to/your/config.toml
    ```
 
-3. 程序将自动：
+### 3.程序将自动：
    - 扫描源目录和目标目录
    - 识别新增的歌曲
    - 转换 NCM 格式并复制到目标目录
    - 显示同步进度和结果
 
-## 依赖
-
-- Rust 1.80 或更高版本
-- 支持的音频格式：
-  - NCM (NetEase Cloud Music)
-  - MP3
-  - FLAC
 
 
 ## 致谢
