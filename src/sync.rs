@@ -75,7 +75,7 @@ pub fn compare_music_dicts<'a>(
                         let max_size = size1.max(size2) as f64;
                         if max_size > 0.0 {
                             let diff = (size1 as f64 - size2 as f64).abs();
-                            return (diff / max_size) >= 0.05;
+                            return (diff / max_size) >= 0.1;
                         }
                         return size1 != size2;
                     }
