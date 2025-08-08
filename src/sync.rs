@@ -1,4 +1,5 @@
 use crate::config::Mode;
+use crate::metadata::{FlacMetadata, Metadata, Mp3Metadata};
 use ncmdump::Ncmdump;
 use rayon::prelude::*;
 use std::collections::HashMap;
@@ -210,36 +211,69 @@ fn process_ncm_file(
             format!("NCM 解析错误 {}: {}", name_stem, e),
         )
     })?;
-
+    // 提取原始音频数据
     let music_data = ncm.get_data().map_err(|e| {
         Error::new(
             ErrorKind::InvalidData,
             format!("NCM 数据提取错误 {}: {}", name_stem, e),
         )
     })?;
-
+    // 提取专辑封面（关键修改点）
+    let image_data = ncm.get_image().map_err(|e| {
+        Error::new(
+            ErrorKind::InvalidData,
+            format!("NCM 封面提取错误 {}: {}", name_stem, e),
+        )
+    })?;
+    // 提取歌曲元数据
     let ncm_metadata = ncm.get_info().map_err(|e| {
         Error::new(
             ErrorKind::InvalidData,
             format!("NCM 元数据错误 {}: {}", name_stem, e),
         )
     })?;
-
+    // 确定输出格式（保持你的逻辑）
     let file_format = if ncm_metadata.format.is_empty() {
         "flac".to_string()
     } else {
         ncm_metadata.format.to_lowercase()
     };
-
+    // 创建目标文件路径
     let temp_file_name = format!("{}.{}", name_stem, file_format);
     let temp_path = Path::new(dest_folder).join(&temp_file_name);
-
+    // 确保目录存在
     if let Some(parent) = temp_path.parent() {
         fs::create_dir_all(parent)?;
     }
-
+    // ===== 关键修改：注入元数据 =====
+    let final_data = match file_format.as_str() {
+        "mp3" => {
+            // 创建MP3元数据注入器
+            Mp3Metadata::new(&ncm_metadata, &image_data, &music_data)
+                .inject_metadata(music_data.clone()) // 注入封面和元数据
+                .map_err(|e| {
+                    Error::new(
+                        ErrorKind::InvalidData,
+                        format!("MP3元数据注入失败 {}: {}", name_stem, e),
+                    )
+                })?
+        }
+        "flac" => {
+            // 创建FLAC元数据注入器
+            FlacMetadata::new(&ncm_metadata, &image_data, &music_data)
+                .inject_metadata(music_data.clone()) // 注入封面和元数据
+                .map_err(|e| {
+                    Error::new(
+                        ErrorKind::InvalidData,
+                        format!("FLAC元数据注入失败 {}: {}", name_stem, e),
+                    )
+                })?
+        }
+        _ => music_data, // 其他格式保持原始数据
+    };
+    // 写入处理后的数据（包含封面）
     let mut temp_file = File::create(&temp_path)?;
-    temp_file.write_all(&music_data)?;
+    temp_file.write_all(&final_data)?;
 
     match (mode, file_format.as_str()) {
         (Mode::Legacy, "flac") => {

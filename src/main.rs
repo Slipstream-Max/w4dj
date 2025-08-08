@@ -1,6 +1,6 @@
 mod config;
 mod sync;
-
+mod metadata;
 use crate::config::{Cmd, Config};
 use crate::sync::{compare_music_dicts, get_music_dict, sync_music_library};
 use clap::Parser;
