@@ -27,22 +27,30 @@ W4DJ 是一个简单的命令行工具，用于同步网易云音乐（Netease C
    cargo build --release
    ```
 4. 可执行文件将位于 `target/release/w4dj`
-5. 安装ffmpeg<br>
+5. 安装ffmpeg
+
 Windows:
 ```bash
+winget update
 winget install "FFmpeg (Essentials Build)"
 ```
 Linux:
 ```bash
+sudo apt update
 sudo apt install ffmpeg
 ```
 Mac:
 ```bash
+#先安装homebrew
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)" 
+brew update
 brew install ffmpeg
 ```
 
-### 2.见Release
-解压后设置config.toml 双击运行
+### 2.运行已经编译好的Release
+解压后设置config.toml 双击运行。
+- 对于Mac若需要启用legacy支持（mp3输出）则需要按照上面的指示安装ffmpeg，
+Windows端已经拥有捆绑的ffmpeg。
 
 ## 使用方法
 
