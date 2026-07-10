@@ -7,12 +7,14 @@ edition = "2024"
 clap = { version = "4.5.39", features = ["derive"] }
 toml = "0.8.22"
 serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.140"
 walkdir = "2.5.0"
-ncmdump = "0.8.0"
+ncmdump = { version = "0.8.0", default-features = false, features = ["ncmdump"] }
 indicatif = "0.17.11"
 rayon = "1.10.0"
-text-to-ascii-art = "0.1.10"
 which = "8.0.0"
 metaflac = "0.2.8"
 id3 = "1.16.3"
 anyhow = "1.0.98"
+lofty = "0.24.0"
+tempfile = "3.20.0"
