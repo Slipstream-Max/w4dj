@@ -1,0 +1,157 @@
+﻿# W4DJ Release Workflow
+#
+# Trigger:
+#   - Push a tag v* (e.g. v0.9) → automatically build & publish
+#   - Manual workflow_dispatch → specify a tag name to publish
+#
+# Builds four targets:
+#   macOS  x86_64 (Intel)   – macos-13 runner
+#   macOS  aarch64 (ARM)    – macos-latest runner (Apple Silicon)
+#   Windows x86_64          – windows-latest runner
+#   Windows aarch64 (ARM)   – cross-compiled on windows-latest runner
+
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Tag to release (e.g. v0.9) – must already exist in repo'
+        required: true
+        default: 'v0.9'
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-apple-darwin
+            os: macos-13
+            ext: tar.gz
+            bin: w4dj
+            desc: macOS Intel
+
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            ext: tar.gz
+            bin: w4dj
+            desc: macOS Apple Silicon
+
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            ext: zip
+            bin: w4dj.exe
+            desc: Windows x86_64
+
+          - target: aarch64-pc-windows-msvc
+            os: windows-latest
+            ext: zip
+            bin: w4dj.exe
+            desc: Windows ARM64
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_type == 'tag' && github.ref || inputs.version }}
+
+      # --------------------------------------------------
+      # Install Rust toolchain + target
+      # --------------------------------------------------
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # --------------------------------------------------
+      # Windows ARM64: MSVC cross-compile environment
+      # --------------------------------------------------
+      - name: Setup MSVC dev environment
+        if: matrix.target == 'aarch64-pc-windows-msvc'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: arm64
+
+      # --------------------------------------------------
+      # Cache dependencies
+      # --------------------------------------------------
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+
+      # --------------------------------------------------
+      # Build release binary
+      # --------------------------------------------------
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+
+      # --------------------------------------------------
+      # Inspect artifact
+      # --------------------------------------------------
+      - name: List artifact
+        run: |
+          ls -lh target/${{ matrix.target }}/release/${{ matrix.bin }}
+        shell: ${{ startsWith(matrix.os, 'windows') && 'pwsh' || 'bash' }}
+
+      # --------------------------------------------------
+      # Package: tar.gz (macOS) / zip (Windows)
+      # --------------------------------------------------
+      - name: Package tar.gz
+        if: matrix.ext == 'tar.gz'
+        run: |
+          cd target/${{ matrix.target }}/release
+          tar czf w4dj-${{ matrix.target }}.tar.gz ${{ matrix.bin }}
+          mv w4dj-${{ matrix.target }}.tar.gz ${{ github.workspace }}/
+
+      - name: Package zip
+        if: matrix.ext == 'zip'
+        shell: pwsh
+        run: |
+          Compress-Archive -Path target/${{ matrix.target }}/release/${{ matrix.bin }} `
+            -DestinationPath w4dj-${{ matrix.target }}.zip
+
+      # --------------------------------------------------
+      # Upload to GitHub Release
+      # --------------------------------------------------
+      - name: Upload binaries to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_type == 'tag' && github.ref_name || inputs.version }}
+          files: |
+            w4dj-${{ matrix.target }}.${{ matrix.ext }}
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ----------------------------------------------------
+  # Summary job
+  # ----------------------------------------------------
+  summary:
+    needs: build
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Summarize
+        run: |
+          echo "## Release ${{ github.ref_name || inputs.version }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Platform | Arch | File |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| macOS | Intel (x86_64) | \`w4dj-x86_64-apple-darwin.tar.gz\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| macOS | Apple Silicon | \`w4dj-aarch64-apple-darwin.tar.gz\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Windows | x86_64 | \`w4dj-x86_64-pc-windows-msvc.zip\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Windows | ARM64 | \`w4dj-aarch64-pc-windows-msvc.zip\` |" >> $GITHUB_STEP_SUMMARY
