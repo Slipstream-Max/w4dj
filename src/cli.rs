@@ -30,7 +30,7 @@ pub struct Cli {
     #[arg(value_name = "PATH")]
     pub dropped_input: Vec<PathBuf>,
 
-    /// Output directory. Defaults to w4djdump next to the executable.
+    /// Output directory. Defaults to w4djdump in the platform Music directory.
     #[arg(long, short = 'o', value_name = "DIR")]
     pub output: Option<PathBuf>,
 
@@ -38,7 +38,7 @@ pub struct Cli {
     #[arg(long, short = 'm', value_enum)]
     pub mode: Option<Mode>,
 
-    /// TOML configuration file. Defaults to .config.toml next to the executable.
+    /// TOML configuration file. Defaults to the platform configuration directory.
     #[arg(long, short = 'c', value_name = "FILE")]
     pub config: Option<PathBuf>,
 }

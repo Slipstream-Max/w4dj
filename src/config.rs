@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use clap::ValueEnum;
+use directories::{BaseDirs, UserDirs};
 use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
 
@@ -127,15 +128,10 @@ impl OneOrManyPaths {
 impl Config {
     pub fn resolve(mut cli: Cli) -> Result<Self> {
         let (exe_dir, cwd) = application_directories()?;
-
-        let explicit_config = cli.config.is_some();
-        let config_path = cli
-            .config
-            .take()
-            .map(|path| absolutize(&cwd, path))
-            .unwrap_or_else(|| default_config_path(&exe_dir, &cwd));
+        let (config_path, explicit_config) = resolve_config_path(cli.config.take(), &cwd)?;
         let file_config = load_file_config(&config_path, explicit_config)?;
         let config_dir = config_path.parent().unwrap_or(&exe_dir);
+        let default_output = default_output_path()?;
 
         let cli_inputs = cli.take_inputs();
         let raw_inputs: Vec<PathBuf> = if cli_inputs.is_empty() {
@@ -158,7 +154,7 @@ impl Config {
             .take()
             .map(|path| absolutize(&cwd, path))
             .or_else(|| file_config.output.map(|path| absolutize(config_dir, path)))
-            .unwrap_or_else(|| exe_dir.join("w4djdump"));
+            .unwrap_or(default_output);
 
         Self::from_paths(
             raw_inputs,
@@ -201,8 +197,7 @@ impl Config {
 
 impl EditableConfig {
     pub fn empty_default() -> Result<Self> {
-        let (exe_dir, cwd) = application_directories()?;
-        let path = default_config_path(&exe_dir, &cwd);
+        let path = default_config_path()?;
         Ok(Self {
             path,
             inputs: Vec::new(),
@@ -210,12 +205,13 @@ impl EditableConfig {
             mode: Mode::Original,
             theme: GuiTheme::System,
             window_opacity: DEFAULT_WINDOW_OPACITY,
-            default_output: exe_dir.join("w4djdump"),
+            default_output: default_output_path()?,
         })
     }
 
     pub fn load_default() -> Result<Self> {
         let mut editable = Self::empty_default()?;
+        let create_default = !editable.path.exists();
         let file_config = load_file_config(&editable.path, false)?;
         editable.inputs = file_config
             .inputs
@@ -226,6 +222,9 @@ impl EditableConfig {
         editable.theme = file_config.gui.theme.unwrap_or_default();
         editable.window_opacity =
             normalize_window_opacity(file_config.gui.opacity.unwrap_or(DEFAULT_WINDOW_OPACITY));
+        if create_default {
+            editable.save()?;
+        }
         Ok(editable)
     }
 
@@ -334,14 +333,33 @@ fn absolutize(base: &Path, path: PathBuf) -> PathBuf {
     }
 }
 
-fn default_config_path(exe_dir: &Path, cwd: &Path) -> PathBuf {
-    let beside_executable = exe_dir.join(".config.toml");
-    let working_directory = cwd.join(".config.toml");
-    if beside_executable.exists() || !working_directory.exists() {
-        beside_executable
-    } else {
-        working_directory
+fn resolve_config_path(explicit: Option<PathBuf>, cwd: &Path) -> Result<(PathBuf, bool)> {
+    match explicit {
+        Some(path) => Ok((absolutize(cwd, path), true)),
+        None => Ok((default_config_path()?, false)),
     }
+}
+
+fn default_config_path() -> Result<PathBuf> {
+    let base_dirs = BaseDirs::new().context("failed to locate the platform config directory")?;
+    Ok(config_path_in(base_dirs.config_dir()))
+}
+
+fn config_path_in(config_root: &Path) -> PathBuf {
+    config_root.join("w4dj").join("config.toml")
+}
+
+fn default_output_path() -> Result<PathBuf> {
+    let user_dirs = UserDirs::new().context("failed to locate the platform user directories")?;
+    let music_dir = user_dirs
+        .audio_dir()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| user_dirs.home_dir().join("Music"));
+    Ok(output_path_in(&music_dir))
+}
+
+fn output_path_in(music_root: &Path) -> PathBuf {
+    music_root.join("w4djdump")
 }
 
 fn application_directories() -> Result<(PathBuf, PathBuf)> {
@@ -444,33 +462,28 @@ mode = "original"
     }
 
     #[test]
-    fn executable_config_takes_precedence_over_working_directory() -> Result<()> {
+    fn explicit_config_path_takes_precedence() -> Result<()> {
         let workspace = tempfile::tempdir()?;
-        let executable = workspace.path().join("bin");
-        let working = workspace.path().join("work");
-        fs::create_dir_all(&executable)?;
-        fs::create_dir_all(&working)?;
-        fs::write(executable.join(".config.toml"), "mode = 'original'")?;
-        assert_eq!(
-            default_config_path(&executable, &working),
-            executable.join(".config.toml")
-        );
+        let (path, explicit) =
+            resolve_config_path(Some(PathBuf::from("custom.toml")), workspace.path())?;
+        assert!(explicit);
+        assert_eq!(path, workspace.path().join("custom.toml"));
         Ok(())
     }
 
     #[test]
-    fn missing_default_config_is_created_beside_the_executable() -> Result<()> {
-        let workspace = tempfile::tempdir()?;
-        let executable = workspace.path().join("bin");
-        let working = workspace.path().join("work");
-        fs::create_dir_all(&executable)?;
-        fs::create_dir_all(&working)?;
-
+    fn standard_config_path_uses_w4dj_directory() {
+        let config_root = Path::new("platform-config");
         assert_eq!(
-            default_config_path(&executable, &working),
-            executable.join(".config.toml")
+            config_path_in(config_root),
+            config_root.join("w4dj").join("config.toml")
         );
-        Ok(())
+    }
+
+    #[test]
+    fn standard_output_path_uses_w4djdump_in_music_directory() {
+        let music_root = Path::new("platform-music");
+        assert_eq!(output_path_in(music_root), music_root.join("w4djdump"));
     }
 
     #[test]

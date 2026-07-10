@@ -1224,7 +1224,7 @@ impl Render for W4djGui {
                     .child(
                         div()
                             .relative()
-                            .h(px(64.0))
+                            .h(px(54.0))
                             .flex()
                             .items_center()
                             .justify_center()
@@ -1233,6 +1233,7 @@ impl Render for W4djGui {
                                     .id("open-settings")
                                     .absolute()
                                     .left_0()
+                                    .bottom_0()
                                     .size_10()
                                     .rounded(px(6.0))
                                     .border_1()
@@ -1257,7 +1258,7 @@ impl Render for W4djGui {
                                     .font_family("Consolas")
                                     .flex()
                                     .flex_col()
-                                    .text_size(px(8.0))
+                                    .text_size(px(9.0))
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .text_color(rgb(ACCENT))
                                     .children(ASCII_LOGO.into_iter().enumerate().map(
@@ -1266,10 +1267,10 @@ impl Render for W4djGui {
                                                 .id(SharedString::from(format!(
                                                     "ascii-logo-{index}"
                                                 )))
-                                                .h(px(8.0))
+                                                .h(px(9.0))
                                                 .flex_none()
                                                 .whitespace_nowrap()
-                                                .line_height(px(8.0))
+                                                .line_height(px(9.0))
                                                 .child(line)
                                         },
                                     )),
@@ -1279,6 +1280,7 @@ impl Render for W4djGui {
                                     .id("add-folder")
                                     .absolute()
                                     .right_0()
+                                    .bottom_0()
                                     .h_9()
                                     .px_4()
                                     .rounded(px(6.0))
@@ -1400,7 +1402,7 @@ impl Render for W4djGui {
                         div()
                             .id("output-folder")
                             .relative()
-                            .h(px(68.0))
+                            .h(px(56.0))
                             .px_4()
                             .rounded(px(6.0))
                             .border_1()
@@ -1419,6 +1421,8 @@ impl Render for W4djGui {
                             )
                             .child(
                                 div()
+                                    .relative()
+                                    .bottom(px(3.0))
                                     .flex()
                                     .flex_col()
                                     .min_w_0()
