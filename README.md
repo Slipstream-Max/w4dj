@@ -9,7 +9,7 @@
 
 ![W4DJ GUI](imgs/w4dj-gui.png)
 
-[暗色模式](imgs\w4dj-gui-dark.png)
+[暗色模式](imgs/w4dj-gui-dark.png)
 
 # W4DJ GUI
 
