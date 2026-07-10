@@ -3,9 +3,22 @@ use std::env;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
 use anyhow::{Context, Result, bail};
 
 use crate::cli::DoctorArgs;
+
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+pub(crate) fn ffmpeg_command(path: &Path) -> Command {
+    let mut command = Command::new(path);
+    #[cfg(windows)]
+    command.creation_flags(CREATE_NO_WINDOW);
+    command
+}
 
 pub fn run(args: DoctorArgs) -> Result<()> {
     println!("W4DJ doctor");
@@ -79,7 +92,7 @@ fn verify_ffmpeg(path: &Path) -> Result<DoctorReport> {
         .trim()
         .to_string();
 
-    let encoders = Command::new(path)
+    let encoders = ffmpeg_command(path)
         .arg("-hide_banner")
         .arg("-encoders")
         .output()
@@ -94,7 +107,7 @@ fn verify_ffmpeg(path: &Path) -> Result<DoctorReport> {
 }
 
 fn version_command(path: &Path) -> std::io::Result<Output> {
-    Command::new(path).arg("-version").output()
+    ffmpeg_command(path).arg("-version").output()
 }
 
 fn ensure_success(path: &Path, action: &str, output: &Output) -> Result<()> {

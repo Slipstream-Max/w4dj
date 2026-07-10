@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use anyhow::{Context, Result, bail};
 use indicatif::{ProgressBar, ProgressStyle};
@@ -46,22 +47,124 @@ struct OutputIndex {
     untagged_by_fallback: HashMap<String, Vec<PathBuf>>,
 }
 
+#[derive(Clone, Debug)]
+pub enum SyncEvent {
+    Status(String),
+    Progress {
+        completed: usize,
+        total: usize,
+        current: Option<String>,
+    },
+    Finished(SyncSummary),
+    Cancelled(SyncSummary),
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct SyncSummary {
+    pub processed: usize,
+    pub skipped: usize,
+    pub failed: usize,
+    pub errors: Vec<String>,
+}
+
 pub fn run(config: &Config) -> Result<()> {
+    let bar = ProgressBar::new(0);
+    bar.set_style(
+        ProgressStyle::with_template(
+            "{spinner:.green} [{elapsed_precise}] [{bar:36.cyan/blue}] {pos}/{len} {msg}",
+        )
+        .expect("valid progress template"),
+    );
+
+    run_with_progress(config, |event| match event {
+        SyncEvent::Status(status) => bar.set_message(status),
+        SyncEvent::Progress {
+            completed,
+            total,
+            current,
+        } => {
+            bar.set_length(total as u64);
+            bar.set_position(completed as u64);
+            if let Some(current) = current {
+                bar.set_message(current);
+            }
+        }
+        SyncEvent::Finished(summary) => {
+            if summary.failed == 0 {
+                bar.finish_and_clear();
+            } else {
+                bar.abandon_with_message("some files failed");
+            }
+            println!(
+                "Sync complete: {} processed, {} skipped, {} failed.",
+                summary.processed, summary.skipped, summary.failed
+            );
+            for error in summary.errors {
+                eprintln!("  {error}");
+            }
+        }
+        SyncEvent::Cancelled(summary) => {
+            bar.abandon_with_message("sync cancelled");
+            println!(
+                "Sync cancelled: {} processed, {} skipped, {} failed.",
+                summary.processed, summary.skipped, summary.failed
+            );
+        }
+    })
+    .map(|_| ())
+}
+
+pub fn run_with_progress(
+    config: &Config,
+    report: impl Fn(SyncEvent) + Sync,
+) -> Result<SyncSummary> {
+    let cancel = AtomicBool::new(false);
+    run_with_progress_cancellable(config, &cancel, report)
+}
+
+pub fn run_with_progress_cancellable(
+    config: &Config,
+    cancel: &AtomicBool,
+    report: impl Fn(SyncEvent) + Sync,
+) -> Result<SyncSummary> {
+    match run_with_progress_inner(config, cancel, &report) {
+        Err(error) if dump::is_cancelled(&error) => {
+            let summary = SyncSummary::default();
+            report(SyncEvent::Cancelled(summary.clone()));
+            Ok(summary)
+        }
+        result => result,
+    }
+}
+
+fn run_with_progress_inner(
+    config: &Config,
+    cancel: &AtomicBool,
+    report: &(impl Fn(SyncEvent) + Sync),
+) -> Result<SyncSummary> {
     let pool = rayon::ThreadPoolBuilder::new()
         .build()
         .context("failed to create the worker pool")?;
 
-    let source_paths = scan_inputs(&config.inputs, &config.output)?;
-    println!(
+    dump::ensure_not_cancelled(cancel)?;
+    let source_paths = scan_inputs(&config.inputs, &config.output, cancel)?;
+    report(SyncEvent::Status(format!(
         "Scanning metadata for {} input files...",
         source_paths.len()
-    );
+    )));
     let inspections = pool.install(|| {
         source_paths
             .par_iter()
-            .map(|path| (path, dump::inspect_source(path)))
+            .filter_map(|path| {
+                if cancel.load(Ordering::Relaxed) {
+                    None
+                } else {
+                    Some((path, dump::inspect_source(path)))
+                }
+            })
             .collect::<Vec<_>>()
     });
+    dump::ensure_not_cancelled(cancel)?;
 
     let mut inspection_errors = Vec::new();
     let mut sources = BTreeMap::<String, SourceItem>::new();
@@ -84,6 +187,7 @@ pub fn run(config: &Config) -> Result<()> {
     let mut located = HashMap::<String, PathBuf>::new();
     let mut unresolved = Vec::new();
     for source in sources.values() {
+        dump::ensure_not_cancelled(cancel)?;
         let Some(entry) = entries.get(&source.id) else {
             if manifest_was_empty {
                 unresolved.push(source.id.clone());
@@ -101,9 +205,12 @@ pub fn run(config: &Config) -> Result<()> {
     let output_index = if unresolved.is_empty() {
         None
     } else {
-        println!("Searching the output tree for moved files...");
-        Some(build_output_index(&config.output, &pool))
+        report(SyncEvent::Status(
+            "Searching the output tree for moved files...".to_string(),
+        ));
+        Some(build_output_index(&config.output, &pool, cancel))
     };
+    dump::ensure_not_cancelled(cancel)?;
 
     if let Some(index) = &output_index {
         let mut location_claims = located
@@ -111,6 +218,7 @@ pub fn run(config: &Config) -> Result<()> {
             .map(|(id, path)| (path_key(path), id.clone()))
             .collect::<HashMap<_, _>>();
         for id in unresolved {
+            dump::ensure_not_cancelled(cancel)?;
             let source = &sources[&id];
             if let Some(path) = find_indexed_output(index, source) {
                 let key = path_key(&path);
@@ -131,6 +239,7 @@ pub fn run(config: &Config) -> Result<()> {
     let profile = config.mode.profile().to_string();
 
     for source in sources.values() {
+        dump::ensure_not_cancelled(cancel)?;
         let previous = entries.get(&source.id).cloned();
         let existing = located.get(&source.id).cloned();
 
@@ -199,19 +308,25 @@ pub fn run(config: &Config) -> Result<()> {
         }
     }
 
-    let bar = ProgressBar::new(jobs.len() as u64);
-    bar.set_style(
-        ProgressStyle::with_template(
-            "{spinner:.green} [{elapsed_precise}] [{bar:36.cyan/blue}] {pos}/{len} {msg}",
-        )
-        .expect("valid progress template"),
-    );
+    let total = jobs.len();
+    report(SyncEvent::Progress {
+        completed: 0,
+        total,
+        current: None,
+    });
+    let completed = AtomicUsize::new(0);
     let results = pool.install(|| {
         jobs.par_iter()
             .map(|job| {
-                bar.set_message(job.source.display_name.clone());
-                let result = dump::process(job);
-                bar.inc(1);
+                let result = dump::process_with_cancel(job, cancel);
+                if !result.as_ref().is_err_and(dump::is_cancelled) {
+                    let completed = completed.fetch_add(1, Ordering::Relaxed) + 1;
+                    report(SyncEvent::Progress {
+                        completed,
+                        total,
+                        current: Some(job.source.display_name.clone()),
+                    });
+                }
                 (job, result)
             })
             .collect::<Vec<_>>()
@@ -233,15 +348,10 @@ pub fn run(config: &Config) -> Result<()> {
                     },
                 );
             }
+            Err(error) if dump::is_cancelled(&error) => {}
             Err(error) => process_errors.push(format!("{}: {error:#}", job.source.path.display())),
         }
     }
-    if process_errors.is_empty() {
-        bar.finish_and_clear();
-    } else {
-        bar.abandon_with_message("some files failed");
-    }
-
     save_manifest(
         &manifest_path,
         Manifest {
@@ -250,27 +360,31 @@ pub fn run(config: &Config) -> Result<()> {
         },
     )?;
 
-    println!(
-        "Sync complete: {} processed, {} skipped, {} failed.",
+    let errors = inspection_errors
+        .into_iter()
+        .chain(process_errors)
+        .collect::<Vec<_>>();
+    let summary = SyncSummary {
         processed,
         skipped,
-        inspection_errors.len() + process_errors.len()
-    );
-    for error in inspection_errors.iter().chain(&process_errors) {
-        eprintln!("  {error}");
+        failed: errors.len(),
+        errors,
+    };
+    if cancel.load(Ordering::Relaxed) {
+        report(SyncEvent::Cancelled(summary.clone()));
+        return Ok(summary);
     }
-    if !inspection_errors.is_empty() || !process_errors.is_empty() {
-        bail!(
-            "{} files could not be synchronized",
-            inspection_errors.len() + process_errors.len()
-        );
+    report(SyncEvent::Finished(summary.clone()));
+    if summary.failed > 0 {
+        bail!("{} files could not be synchronized", summary.failed);
     }
-    Ok(())
+    Ok(summary)
 }
 
-fn scan_inputs(inputs: &[PathBuf], output: &Path) -> Result<Vec<PathBuf>> {
+fn scan_inputs(inputs: &[PathBuf], output: &Path, cancel: &AtomicBool) -> Result<Vec<PathBuf>> {
     let mut files = HashSet::new();
     for input in inputs {
+        dump::ensure_not_cancelled(cancel)?;
         if input.is_file() {
             if is_supported(input) {
                 files.insert(input.clone());
@@ -285,6 +399,7 @@ fn scan_inputs(inputs: &[PathBuf], output: &Path) -> Result<Vec<PathBuf>> {
             .into_iter()
             .filter_entry(|entry| should_enter(entry, output));
         for entry in walker {
+            dump::ensure_not_cancelled(cancel)?;
             match entry {
                 Ok(entry) if entry.file_type().is_file() && is_supported(entry.path()) => {
                     let path = fs::canonicalize(entry.path()).with_context(|| {
@@ -315,33 +430,44 @@ fn select_best_source(sources: &mut BTreeMap<String, SourceItem>, candidate: Sou
     }
 }
 
-fn build_output_index(output: &Path, pool: &rayon::ThreadPool) -> OutputIndex {
+fn build_output_index(output: &Path, pool: &rayon::ThreadPool, cancel: &AtomicBool) -> OutputIndex {
     let paths = WalkDir::new(output)
         .follow_links(false)
         .into_iter()
-        .filter_map(|entry| match entry {
-            Ok(entry)
-                if entry.file_type().is_file()
-                    && is_supported(entry.path())
-                    && !is_temporary(entry.path()) =>
-            {
-                Some(entry.path().to_path_buf())
+        .filter_map(|entry| {
+            if cancel.load(Ordering::Relaxed) {
+                return None;
             }
-            Ok(_) => None,
-            Err(error) => {
-                eprintln!("output scan warning: {error}");
-                None
+            match entry {
+                Ok(entry)
+                    if entry.file_type().is_file()
+                        && is_supported(entry.path())
+                        && !is_temporary(entry.path()) =>
+                {
+                    Some(entry.path().to_path_buf())
+                }
+                Ok(_) => None,
+                Err(error) => {
+                    eprintln!("output scan warning: {error}");
+                    None
+                }
             }
         })
         .collect::<Vec<_>>();
     let identities = pool.install(|| {
         paths
             .par_iter()
-            .filter_map(|path| match dump::inspect_output(path) {
-                Ok(identity) => Some((path.clone(), identity)),
-                Err(error) => {
-                    eprintln!("output metadata warning for {}: {error:#}", path.display());
+            .filter_map(|path| {
+                if cancel.load(Ordering::Relaxed) {
                     None
+                } else {
+                    match dump::inspect_output(path) {
+                        Ok(identity) => Some((path.clone(), identity)),
+                        Err(error) => {
+                            eprintln!("output metadata warning for {}: {error:#}", path.display());
+                            None
+                        }
+                    }
                 }
             })
             .collect::<Vec<_>>()
@@ -578,12 +704,72 @@ fn is_temporary(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use std::io::Write as _;
+    use std::sync::{Mutex, atomic::AtomicBool};
 
     use id3::frame::ExtendedText;
     use id3::{TagLike, Version};
     use tempfile::tempdir;
 
     use super::*;
+
+    #[test]
+    fn pre_cancelled_sync_reports_cancellation() -> Result<()> {
+        let workspace = tempdir()?;
+        let input = workspace.path().join("input");
+        let output = workspace.path().join("output");
+        fs::create_dir_all(&input)?;
+        fs::create_dir_all(&output)?;
+        let config = Config {
+            inputs: vec![input],
+            output: output.clone(),
+            mode: crate::config::Mode::Original,
+        };
+        let cancel = AtomicBool::new(true);
+        let cancelled = Mutex::new(false);
+
+        let summary = run_with_progress_cancellable(&config, &cancel, |event| {
+            if matches!(event, SyncEvent::Cancelled(_)) {
+                *cancelled.lock().unwrap() = true;
+            }
+        })?;
+
+        assert!(*cancelled.lock().unwrap());
+        assert_eq!(summary.processed, 0);
+        assert!(!output.join(MANIFEST_NAME).exists());
+        Ok(())
+    }
+
+    #[test]
+    fn cancellation_after_planning_does_not_publish_output() -> Result<()> {
+        let workspace = tempdir()?;
+        let input = workspace.path().join("input");
+        let output = workspace.path().join("output");
+        fs::create_dir_all(&input)?;
+        fs::create_dir_all(&output)?;
+        write_test_wav(&input.join("Song.wav"), None)?;
+        let config = Config {
+            inputs: vec![input],
+            output: output.clone(),
+            mode: crate::config::Mode::Original,
+        };
+        let cancel = AtomicBool::new(false);
+        let cancelled = Mutex::new(false);
+
+        let summary = run_with_progress_cancellable(&config, &cancel, |event| match event {
+            SyncEvent::Progress {
+                completed: 0,
+                total: 1,
+                ..
+            } => cancel.store(true, Ordering::Relaxed),
+            SyncEvent::Cancelled(_) => *cancelled.lock().unwrap() = true,
+            _ => {}
+        })?;
+
+        assert!(*cancelled.lock().unwrap());
+        assert_eq!(summary.processed, 0);
+        assert!(!output.join("Song.wav").exists());
+        Ok(())
+    }
 
     fn source(id: &str) -> SourceItem {
         SourceItem {

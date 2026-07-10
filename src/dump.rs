@@ -1,7 +1,10 @@
 use std::fs::{self, File};
-use std::io::{self, Read, Write};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use id3::frame::{ExtendedText, Picture, PictureType as Id3PictureType};
@@ -16,8 +19,32 @@ use serde::{Deserialize, Serialize};
 use tempfile::{Builder as TempBuilder, TempPath};
 
 use crate::config::Mode;
+use crate::doctor;
 
 const W4DJ_ID: &str = "W4DJ_ID";
+
+#[derive(Debug)]
+pub(crate) struct Cancelled;
+
+impl std::fmt::Display for Cancelled {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("operation cancelled")
+    }
+}
+
+impl std::error::Error for Cancelled {}
+
+pub(crate) fn ensure_not_cancelled(cancel: &AtomicBool) -> Result<()> {
+    if cancel.load(Ordering::Relaxed) {
+        Err(Cancelled.into())
+    } else {
+        Ok(())
+    }
+}
+
+pub(crate) fn is_cancelled(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<Cancelled>().is_some()
+}
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SourceVariant {
@@ -137,7 +164,8 @@ pub fn inspect_output(path: &Path) -> Result<OutputIdentity> {
     })
 }
 
-pub fn process(job: &Job) -> Result<()> {
+pub(crate) fn process_with_cancel(job: &Job, cancel: &AtomicBool) -> Result<()> {
+    ensure_not_cancelled(cancel)?;
     let parent = job
         .target
         .parent()
@@ -145,7 +173,8 @@ pub fn process(job: &Job) -> Result<()> {
     fs::create_dir_all(parent)
         .with_context(|| format!("failed to create output directory {}", parent.display()))?;
 
-    let (metadata, prepared_audio) = prepare_source(&job.source, parent)?;
+    let (metadata, prepared_audio) = prepare_source(&job.source, parent, cancel)?;
+    ensure_not_cancelled(cancel)?;
     let target_format = job.mode.extension(&job.source.variant.format);
     let final_temp = if job.mode.needs_ffmpeg() {
         let temp = create_temp(parent, target_format)?;
@@ -156,6 +185,7 @@ pub fn process(job: &Job) -> Result<()> {
             prepared_audio.path(),
             temp.as_ref(),
             job.mode,
+            cancel,
         )?;
         temp
     } else {
@@ -164,7 +194,11 @@ pub fn process(job: &Job) -> Result<()> {
             PreparedAudio::Borrowed(path) => {
                 let temp = create_temp(parent, target_format)?;
                 let temp_path: &Path = temp.as_ref();
-                fs::copy(&path, temp_path).with_context(|| {
+                let mut input = File::open(&path)
+                    .with_context(|| format!("failed to open {} for copying", path.display()))?;
+                let mut output = File::create(temp_path)
+                    .context("failed to create temporary output for copying")?;
+                copy_with_cancel(&mut input, &mut output, cancel).with_context(|| {
                     format!("failed to copy {} to a temporary file", path.display())
                 })?;
                 temp
@@ -172,12 +206,14 @@ pub fn process(job: &Job) -> Result<()> {
         }
     };
 
+    ensure_not_cancelled(cancel)?;
     write_metadata(
         final_temp.as_ref(),
         target_format,
         &metadata,
         &job.source.id,
     )?;
+    ensure_not_cancelled(cancel)?;
     let identity = inspect_output(final_temp.as_ref())
         .with_context(|| format!("output validation failed for {}", job.source.path.display()))?;
     if !identity_matches_source(&identity, &job.source) {
@@ -255,7 +291,12 @@ fn inspect_ncm(path: &Path, size: u64, display_name: String) -> Result<SourceIte
     })
 }
 
-fn prepare_source(source: &SourceItem, temp_dir: &Path) -> Result<(MediaMetadata, PreparedAudio)> {
+fn prepare_source(
+    source: &SourceItem,
+    temp_dir: &Path,
+    cancel: &AtomicBool,
+) -> Result<(MediaMetadata, PreparedAudio)> {
+    ensure_not_cancelled(cancel)?;
     if extension(&source.path) == "ncm" {
         let file = File::open(&source.path)
             .with_context(|| format!("failed to open {}", source.path.display()))?;
@@ -277,7 +318,7 @@ fn prepare_source(source: &SourceItem, temp_dir: &Path) -> Result<(MediaMetadata
         let temp_path: &Path = temp.as_ref();
         let mut output =
             File::create(temp_path).context("failed to create NCM temporary output")?;
-        io::copy(&mut ncm, &mut output)
+        copy_with_cancel(&mut ncm, &mut output, cancel)
             .with_context(|| format!("failed to dump NCM file {}", source.path.display()))?;
         output.flush()?;
         Ok((metadata, PreparedAudio::Temporary(temp)))
@@ -301,8 +342,15 @@ impl PreparedAudio {
     }
 }
 
-fn transcode(ffmpeg: &Path, input: &Path, output: &Path, mode: Mode) -> Result<()> {
-    let mut command = Command::new(ffmpeg);
+fn transcode(
+    ffmpeg: &Path,
+    input: &Path,
+    output: &Path,
+    mode: Mode,
+    cancel: &AtomicBool,
+) -> Result<()> {
+    ensure_not_cancelled(cancel)?;
+    let mut command = doctor::ffmpeg_command(ffmpeg);
     command
         .arg("-nostdin")
         .arg("-y")
@@ -334,18 +382,76 @@ fn transcode(ffmpeg: &Path, input: &Path, output: &Path, mode: Mode) -> Result<(
         Mode::Original => bail!("original mode must not invoke FFmpeg"),
     }
 
-    let status = command
+    let mut child = command
         .arg(output)
-        .status()
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
         .with_context(|| format!("failed to run FFmpeg at {}", ffmpeg.display()))?;
+    let mut child_stderr = child
+        .stderr
+        .take()
+        .context("failed to capture FFmpeg error output")?;
+    let stderr_reader = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let result = child_stderr.read_to_end(&mut bytes);
+        (result, bytes)
+    });
+    let status = loop {
+        if cancel.load(Ordering::Relaxed) {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = stderr_reader.join();
+            return Err(Cancelled.into());
+        }
+        if let Some(status) = child
+            .try_wait()
+            .context("failed to wait for FFmpeg to finish")?
+        {
+            break status;
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+    let (stderr_result, stderr) = stderr_reader
+        .join()
+        .map_err(|_| anyhow::anyhow!("FFmpeg error reader panicked"))?;
+    stderr_result.context("failed to read FFmpeg error output")?;
     if !status.success() {
+        let detail = String::from_utf8_lossy(&stderr);
+        if detail.trim().is_empty() {
+            bail!(
+                "FFmpeg failed for {} with status {}",
+                input.display(),
+                status
+            );
+        }
         bail!(
-            "FFmpeg failed for {} with status {}",
+            "FFmpeg failed for {} with status {}: {}",
             input.display(),
-            status
+            status,
+            detail.trim()
         );
     }
     Ok(())
+}
+
+fn copy_with_cancel(
+    input: &mut impl Read,
+    output: &mut impl Write,
+    cancel: &AtomicBool,
+) -> Result<u64> {
+    let mut buffer = [0_u8; 64 * 1024];
+    let mut copied = 0_u64;
+    loop {
+        ensure_not_cancelled(cancel)?;
+        let read = input.read(&mut buffer)?;
+        if read == 0 {
+            return Ok(copied);
+        }
+        output.write_all(&buffer[..read])?;
+        copied += read as u64;
+    }
 }
 
 fn read_ncm_info(path: &Path) -> Result<NcmInfo> {
@@ -644,11 +750,24 @@ fn image_mime_type(bytes: &[u8]) -> &'static str {
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::io::Write as _;
+    use std::io::{Cursor, Write as _};
+    use std::sync::atomic::AtomicBool;
 
     use tempfile::tempdir;
 
     use super::*;
+
+    #[test]
+    fn cancelled_copy_stops_before_writing() {
+        let cancel = AtomicBool::new(true);
+        let mut input = Cursor::new(vec![1_u8; 128 * 1024]);
+        let mut output = Vec::new();
+
+        let error = copy_with_cancel(&mut input, &mut output, &cancel).unwrap_err();
+
+        assert!(is_cancelled(&error));
+        assert!(output.is_empty());
+    }
 
     #[test]
     fn lossless_source_replaces_lossy_source() {
