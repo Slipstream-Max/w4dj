@@ -105,7 +105,7 @@ jobs:
       - name: List artifact
         run: |
           ls -lh target/${{ matrix.target }}/release/${{ matrix.bin }}
-        shell: ${{ startsWith(matrix.os, 'windows') && 'pwsh' || 'bash' }}
+        shell: ${{ runner.os == 'Windows' && 'pwsh' || 'bash' }}
 
       # --------------------------------------------------
       # Package: tar.gz (macOS) / zip (Windows)
