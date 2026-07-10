@@ -1,27 +1,23 @@
-﻿# W4DJ Release Workflow
+# W4DJ release workflow
 #
-# Trigger:
-#   - Push a tag v* (e.g. v0.9) → automatically build & publish
-#   - Manual workflow_dispatch → specify a tag name to publish
-#
-# Builds four targets:
-#   macOS  x86_64 (Intel)   – macos-13 runner
-#   macOS  aarch64 (ARM)    – macos-latest runner (Apple Silicon)
-#   Windows x86_64          – windows-latest runner
-#   Windows aarch64 (ARM)   – cross-compiled on windows-latest runner
+# Builds native binaries for macOS and Windows on Intel/AMD64 and ARM64.
 
 name: Release
 
 on:
   push:
     tags:
-      - 'v*'
+      - "v*"
   workflow_dispatch:
     inputs:
       version:
-        description: 'Tag to release (e.g. v0.9) – must already exist in repo'
+        description: "Existing tag to release (for example, v0.9)"
         required: true
-        default: 'v0.9'
+        default: "v0.9"
+        type: string
+
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -29,61 +25,55 @@ env:
 
 jobs:
   build:
-    name: ${{ matrix.target }}
+    name: ${{ matrix.description }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - target: x86_64-apple-darwin
-            os: macos-13
-            ext: tar.gz
-            bin: w4dj
-            desc: macOS Intel
+            os: macos-15-intel
+            archive: tar.gz
+            binary: w4dj
+            description: macOS x86_64
 
           - target: aarch64-apple-darwin
-            os: macos-latest
-            ext: tar.gz
-            bin: w4dj
-            desc: macOS Apple Silicon
+            os: macos-15
+            archive: tar.gz
+            binary: w4dj
+            description: macOS ARM64
 
           - target: x86_64-pc-windows-msvc
-            os: windows-latest
-            ext: zip
-            bin: w4dj.exe
-            desc: Windows x86_64
+            os: windows-2025
+            msvc_arch: x64
+            archive: zip
+            binary: w4dj.exe
+            description: Windows x86_64
 
           - target: aarch64-pc-windows-msvc
-            os: windows-latest
-            ext: zip
-            bin: w4dj.exe
-            desc: Windows ARM64
+            os: windows-11-arm
+            msvc_arch: arm64
+            archive: zip
+            binary: w4dj.exe
+            description: Windows ARM64
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Check out release tag
+        uses: actions/checkout@v4
         with:
           ref: ${{ github.ref_type == 'tag' && github.ref || inputs.version }}
 
-      # --------------------------------------------------
-      # Install Rust toolchain + target
-      # --------------------------------------------------
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
 
-      # --------------------------------------------------
-      # Windows ARM64: MSVC cross-compile environment
-      # --------------------------------------------------
-      - name: Setup MSVC dev environment
-        if: matrix.target == 'aarch64-pc-windows-msvc'
+      - name: Set up MSVC
+        if: runner.os == 'Windows'
         uses: ilammy/msvc-dev-cmd@v1
         with:
-          arch: arm64
+          arch: ${{ matrix.msvc_arch }}
 
-      # --------------------------------------------------
-      # Cache dependencies
-      # --------------------------------------------------
       - name: Cache Cargo
         uses: actions/cache@v4
         with:
@@ -91,67 +81,73 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-cargo-${{ matrix.target }}-
 
-      # --------------------------------------------------
-      # Build release binary
-      # --------------------------------------------------
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}
 
-      # --------------------------------------------------
-      # Inspect artifact
-      # --------------------------------------------------
-      - name: List artifact
-        run: |
-          ls -lh target/${{ matrix.target }}/release/${{ matrix.bin }}
-        shell: ${{ runner.os == 'Windows' && 'pwsh' || 'bash' }}
+      - name: Inspect artifact (macOS)
+        if: runner.os == 'macOS'
+        run: ls -lh target/${{ matrix.target }}/release/${{ matrix.binary }}
 
-      # --------------------------------------------------
-      # Package: tar.gz (macOS) / zip (Windows)
-      # --------------------------------------------------
+      - name: Inspect artifact (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Get-Item target/${{ matrix.target }}/release/${{ matrix.binary }} | Format-List Name,Length,FullName
+
       - name: Package tar.gz
-        if: matrix.ext == 'tar.gz'
+        if: matrix.archive == 'tar.gz'
+        shell: bash
         run: |
-          cd target/${{ matrix.target }}/release
-          tar czf w4dj-${{ matrix.target }}.tar.gz ${{ matrix.bin }}
-          mv w4dj-${{ matrix.target }}.tar.gz ${{ github.workspace }}/
+          tar -C target/${{ matrix.target }}/release \
+            -czf w4dj-${{ matrix.target }}.tar.gz \
+            ${{ matrix.binary }}
 
       - name: Package zip
-        if: matrix.ext == 'zip'
+        if: matrix.archive == 'zip'
         shell: pwsh
-        run: |
-          Compress-Archive -Path target/${{ matrix.target }}/release/${{ matrix.bin }} `
-            -DestinationPath w4dj-${{ matrix.target }}.zip
+        run: Compress-Archive -Path target/${{ matrix.target }}/release/${{ matrix.binary }} -DestinationPath w4dj-${{ matrix.target }}.zip
 
-      # --------------------------------------------------
-      # Upload to GitHub Release
-      # --------------------------------------------------
-      - name: Upload binaries to release
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: w4dj-${{ matrix.target }}
+          path: w4dj-${{ matrix.target }}.${{ matrix.archive }}
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: w4dj-*
+          path: dist
+          merge-multiple: true
+
+      - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_type == 'tag' && github.ref_name || inputs.version }}
-          files: |
-            w4dj-${{ matrix.target }}.${{ matrix.ext }}
+          files: dist/*
           generate_release_notes: true
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-  # ----------------------------------------------------
-  # Summary job
-  # ----------------------------------------------------
-  summary:
-    needs: build
-    runs-on: ubuntu-latest
-    if: always()
-    steps:
-      - name: Summarize
+      - name: Write summary
+        shell: bash
         run: |
-          echo "## Release ${{ github.ref_name || inputs.version }}" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "| Platform | Arch | File |" >> $GITHUB_STEP_SUMMARY
-          echo "|---|---|---|" >> $GITHUB_STEP_SUMMARY
-          echo "| macOS | Intel (x86_64) | \`w4dj-x86_64-apple-darwin.tar.gz\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| macOS | Apple Silicon | \`w4dj-aarch64-apple-darwin.tar.gz\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| Windows | x86_64 | \`w4dj-x86_64-pc-windows-msvc.zip\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| Windows | ARM64 | \`w4dj-aarch64-pc-windows-msvc.zip\` |" >> $GITHUB_STEP_SUMMARY
+          cat >> "$GITHUB_STEP_SUMMARY" <<'EOF'
+          ## Release artifacts
+
+          | Platform | Architecture | File |
+          |---|---|---|
+          | macOS | x86_64 | `w4dj-x86_64-apple-darwin.tar.gz` |
+          | macOS | ARM64 | `w4dj-aarch64-apple-darwin.tar.gz` |
+          | Windows | x86_64 | `w4dj-x86_64-pc-windows-msvc.zip` |
+          | Windows | ARM64 | `w4dj-aarch64-pc-windows-msvc.zip` |
+          EOF
